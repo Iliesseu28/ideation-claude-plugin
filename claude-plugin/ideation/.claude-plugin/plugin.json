@@ -1,0 +1,38 @@
+{
+  "name": "ideation",
+  "version": "1.5.0",
+  "description": "Relie Claude Code à ton projet Idéation : Claude tient lui-même le Journal de bord (ce qu'il a terminé, preuves à l'appui) la liste To-do (il note ce qui est remis à plus tard et coche ce qui est réglé, avec une preuve) et les Documents utiles du projet ; il lit tout le projet (description, équipe, analyses, tes conversations Feeko, dépenses, liens) tient la roadmap du projet (étape X sur N), prépare les notes de version, et, sur ta demande, lance une analyse, interroge Feeko, crée un lien d'invitation ou un nouveau projet — selon les permissions choisies pour la clé.",
+  "author": { "name": "Ideation" },
+  "homepage": "https://github.com/Iliesseu28/ideation_new/tree/main/claude-plugin/ideation",
+  "repository": "https://github.com/Iliesseu28/ideation_new",
+  "keywords": ["ideation", "journal", "devlog", "changelog", "todo", "taches", "mcp", "suivi-de-projet", "documents", "depenses", "permissions", "roadmap", "release-notes"],
+  "userConfig": {
+    "api_token": {
+      "type": "string",
+      "title": "Clé de connexion Idéation (commence par idn_)",
+      "description": "Ta clé de compte, créée dans l'app : Paramètres → Claude Code (une seule clé pour tous tes projets ; une ancienne clé de projet marche encore). Rangée dans le trousseau, jamais dans settings.json.",
+      "sensitive": true,
+      "required": true
+    },
+    "api_url": {
+      "type": "string",
+      "title": "Adresse du serveur MCP",
+      "description": "À ne changer que pour un émulateur ou un environnement de test.",
+      "default": "https://europe-west1-ideation-dd18f.cloudfunctions.net/ideationMcp"
+    },
+    "auto_journal": {
+      "type": "string",
+      "title": "Journal automatique",
+      "description": "auto : Claude est relancé en fin de tour s'il reste des commits non journalisés · rappel : statut + notification seulement · off : rien.",
+      "options": ["auto", "rappel", "off"],
+      "default": "auto"
+    },
+    "auto_todos": {
+      "type": "string",
+      "title": "To-dos automatiques",
+      "description": "auto : Claude est rappelé de noter ou clore les to-dos du projet (reports, TODO laissés dans le code, travail réglé) · rappel : statut + notification seulement · off : rien (/todo reste disponible).",
+      "options": ["auto", "rappel", "off"],
+      "default": "auto"
+    }
+  }
+}
