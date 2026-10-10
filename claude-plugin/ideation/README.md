@@ -38,7 +38,7 @@ Le serveur MCP et la skill marchent seuls ; le mod est un bonus (sessions où le
 2. Dans Claude Code, **ouvert dans le dépôt de ton app** :
 
 ```
-/plugin marketplace add iliesseu28/ideation_new
+/plugin marketplace add Iliesseu28/ideation-claude-plugin
 /plugin install ideation@ideation
 ```
 
