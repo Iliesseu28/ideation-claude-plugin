@@ -6,8 +6,8 @@
     {
       "name": "ideation",
       "source": "./claude-plugin/ideation",
-      "description": "Journal de bord, To-dos, Documents, analyses, dépenses et liens Idéation (selon les permissions de la clé) : serveur MCP, skills et rappels automatiques en fin de tour.",
-      "version": "1.5.0"
+      "description": "Journal de bord, To-dos, Documents, analyses, dépenses et liens Idéation (selon les permissions de la clé) : serveur MCP, skills et rappels automatiques en fin de tour, sur tous les dépôts où Claude commite (installation en portée user).",
+      "version": "1.6.0"
     }
   ]
 }

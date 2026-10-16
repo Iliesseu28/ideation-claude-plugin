@@ -1,11 +1,11 @@
 {
   "name": "ideation",
-  "version": "1.5.0",
-  "description": "Relie Claude Code à ton projet Idéation : Claude tient lui-même le Journal de bord (ce qu'il a terminé, preuves à l'appui) la liste To-do (il note ce qui est remis à plus tard et coche ce qui est réglé, avec une preuve) et les Documents utiles du projet ; il lit tout le projet (description, équipe, analyses, tes conversations Feeko, dépenses, liens) tient la roadmap du projet (étape X sur N), prépare les notes de version, et, sur ta demande, lance une analyse, interroge Feeko, crée un lien d'invitation ou un nouveau projet — selon les permissions choisies pour la clé.",
+  "version": "1.6.0",
+  "description": "Relie Claude Code à ton projet Idéation, tout seul et dans tous tes dépôts (installation en portée user ; chaque dépôt est relié à son projet par un fichier .ideation.json) : Claude tient lui-même le Journal de bord (ce qu'il a terminé, preuves à l'appui) la liste To-do (il note ce qui est remis à plus tard et coche ce qui est réglé, avec une preuve) et les Documents utiles du projet ; il lit tout le projet (description, équipe, analyses, tes conversations Feeko, dépenses, liens) tient la roadmap du projet (étape X sur N), prépare les notes de version, et, sur ta demande, lance une analyse, interroge Feeko, crée un lien d'invitation ou un nouveau projet, selon les permissions choisies pour la clé.",
   "author": { "name": "Ideation" },
   "homepage": "https://github.com/Iliesseu28/ideation_new/tree/main/claude-plugin/ideation",
   "repository": "https://github.com/Iliesseu28/ideation_new",
-  "keywords": ["ideation", "journal", "devlog", "changelog", "todo", "taches", "mcp", "suivi-de-projet", "documents", "depenses", "permissions", "roadmap", "release-notes"],
+  "keywords": ["ideation", "automatique", "multi-depots", "journal", "devlog", "changelog", "todo", "taches", "mcp", "suivi-de-projet", "documents", "depenses", "permissions", "roadmap", "release-notes"],
   "userConfig": {
     "api_token": {
       "type": "string",

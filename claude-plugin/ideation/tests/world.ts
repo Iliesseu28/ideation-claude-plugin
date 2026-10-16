@@ -6,6 +6,8 @@ import { mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 export const ROOT = '/work/mon-app'
+export const HOME = '/home/moi'
+export const SESSION = 'sess-1'
 export const SHA_A = 'a'.repeat(40)
 export const SHA_B = 'b'.repeat(40)
 export const SHA_C = 'c'.repeat(40)
@@ -61,6 +63,17 @@ export type FakeGit = {
 
 export type Setup = {
   git?: Partial<FakeGit>
+  /**
+   * Autres dépôts (1.6.0), atteints par `git -C <dossier>` : racine → dépôt. Un dossier sous une
+   * racine connue est dans ce dépôt ; ailleurs, `git -C` répond « not a git repository ».
+   */
+  repos?: Record<string, Partial<FakeGit>>
+  /** Dossier courant de la session ($.session.cwd), défaut ROOT. */
+  cwd?: string
+  /** $HOME ($.env.get), défaut HOME. */
+  home?: string
+  /** `$.fs.write` échoue (dossier en lecture seule…). */
+  writeFails?: boolean
   store?: Record<string, unknown>
   /** Opération du store qui échoue. */
   storeFails?: 'get' | 'set'
@@ -102,6 +115,8 @@ export type TodoAnswer = 'ok' | 'noop' | 'error' | 'deny'
 
 export type World = {
   git: FakeGit
+  /** Autres dépôts, par racine. */
+  repos: Map<string, FakeGit>
   store: Map<string, unknown>
   statuses: (string | undefined)[]
   toasts: string[]
@@ -139,6 +154,12 @@ export function world(on: On, setup: Setup = {}): World {
       // Copie : un test qui ajoute un commit ne touche pas les constantes partagées.
       commits: [...(setup.git?.commits ?? [])],
     },
+    repos: new Map(
+      Object.entries(setup.repos ?? {}).map(([root, g]) => [
+        root,
+        { root, head: SHA_B, ancestors: [], email: ME, ...g, commits: [...(g.commits ?? [])] } as FakeGit,
+      ]),
+    ),
     store: new Map(Object.entries(setup.store ?? {})),
     statuses: [],
     toasts: [],
@@ -149,10 +170,24 @@ export function world(on: On, setup: Setup = {}): World {
     files: new Map(Object.entries(setup.files ?? {})),
     clock: mock.clock(on),
   }
+  /** Dépôt d'un dossier (`git -C`) : le dépôt courant si le dossier est sous sa racine, sinon un autre. */
+  const repoAt = (dir: string): FakeGit | null => {
+    const under = (root: string | null) => root !== null && (dir === root || dir.startsWith(`${root}/`))
+    if (under(w.git.root)) return w.git
+    for (const g of w.repos.values()) if (under(g.root)) return g
+    return null
+  }
   on('process.run', async ($, e) => {
-    const g = w.git
+    let args = e.argv.slice(1).map(String)
+    let g: FakeGit = w.git
+    if (args[0] === '-C') {
+      const found = repoAt(String(args[1]))
+      args = args.slice(2)
+      if (w.git.broken) return { deny: 'spawn git ENOENT' }
+      if (!found) return fail(128)
+      g = found
+    }
     if (g.broken) return { deny: 'spawn git ENOENT' }
-    const args = e.argv.slice(1).map(String)
     if (args[0] === 'rev-parse' && args.includes('--show-toplevel')) {
       if (args.includes('--path-format=absolute')) {
         if (g.old) return fail(129)
@@ -226,6 +261,14 @@ export function world(on: On, setup: Setup = {}): World {
     return { value: text }
   })
   on('fs.exists', async ($, e) => ({ value: w.files.has(e.path) }))
+  on('fs.write', async ($, e) => {
+    if (setup.writeFails) return { deny: 'EACCES: read-only' }
+    w.files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('session.id', async () => ({ value: SESSION }))
+  on('session.cwd', async () => ({ value: setup.cwd ?? ROOT }))
+  on('env.get', async ($, e) => ({ value: e.name === 'HOME' ? (setup.home ?? HOME) : undefined }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('classic.Stop', async () => ({ ...setup.stop }))
   if (setup.addEntry) {

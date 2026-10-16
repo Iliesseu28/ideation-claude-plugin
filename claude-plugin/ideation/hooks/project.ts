@@ -302,14 +302,15 @@ const quoted = (link: ProjectLink) => (link.title ? `« ${link.title} » (${link
 export const LINK_TOOL_SPEC = {
   name: LINK_TOOL_NAME,
   description: [
-    "Relie le dépôt git courant à un projet Idéation (enregistré en local par le plugin, aucun appel réseau) : le plugin te rappellera ensuite ce project_id à chaque session dans ce dépôt.",
-    "À appeler UNE fois, après projects_list et la confirmation de l'utilisateur ; de nouveau seulement s'il demande de changer de projet. project_id = l'id renvoyé par projects_list ; title = son titre (une ligne).",
+    "Relie un dépôt git à un projet Idéation, sans appel réseau : écrit `.ideation.json` à la racine du dépôt (à commiter avec lui, aucun secret) et le retient en local ; le plugin te rappellera ensuite ce project_id dans ce dépôt.",
+    "À appeler UNE fois par dépôt, après projects_list (ou repo_link / project_suggest), de nouveau seulement si l'utilisateur demande de changer de projet. project_id = l'id du projet ; title = son titre (une ligne) ; repo_path = un dossier du dépôt visé (défaut : le dossier courant).",
   ].join(' '),
   inputSchema: {
     type: 'object',
     properties: {
       project_id: { type: 'string', pattern: PROJECT_ID_RE.source, description: 'Id du projet Idéation (renvoyé par projects_list).' },
       title: { type: 'string', maxLength: 200, description: 'Titre du projet, tel que projects_list le renvoie.' },
+      repo_path: { type: 'string', maxLength: 4096, description: 'Chemin absolu d’un dossier du dépôt à relier (défaut : le dossier courant de la session).' },
     },
     required: ['project_id', 'title'],
     additionalProperties: false,
@@ -328,8 +329,8 @@ export function linkSection(link: ProjectLink | null): string {
   }
   return [
     '# Projet Idéation de ce dépôt',
-    "Aucun projet Idéation relié à ce dépôt : avant d'écrire, appelle projects_list, demande à l'utilisateur lequel correspond (s'il n'y en a qu'un, propose-le et fais confirmer), puis appelle link_project (`mcp__ideation__link_project`).",
-    "- Ensuite, passe ce project_id à CHAQUE outil ideation. N'écris jamais dans un projet que l'utilisateur n'a pas confirmé.",
+    "Aucun projet Idéation relié à ce dépôt (pas de `.ideation.json` à sa racine) : avant d'écrire, appelle projects_list ; un seul titre correspond clairement à ce dépôt → repo_link si le dépôt a un remote, puis link_project (`mcp__ideation__link_project`, il écrit `.ideation.json`) ; aucun → project_suggest puis pareil. Ne demande à l'utilisateur que si deux projets sont plausibles, et ne lui raconte pas ces étapes.",
+    "- Ensuite, passe ce project_id à CHAQUE outil ideation. N'écris jamais dans un projet qui ne correspond pas clairement à ce dépôt.",
   ].join('\n')
 }
 

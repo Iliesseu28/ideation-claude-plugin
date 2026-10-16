@@ -26,6 +26,11 @@
 // l'outil local `link_project` ou par la première écriture réussie qui portait `project_id` ;
 // section `ideation:projet-du-depot` (passe ce project_id à chaque outil, ou choisis-le avec
 // projects_list) ; commande /projet (--delier pour l'oublier). Un projet retenu vaut liaison.
+// Plusieurs dépôts (1.6.0, docs/claude-connect/AUTOMATIQUE.md) : le lien vient d'abord du fichier
+// `.ideation.json` à la racine du dépôt (commité), puis du store ; chaque `git commit` lancé par Bash
+// (`git -C <dir>`, `cd <dir> &&`, sinon dossier courant) ajoute son dépôt à la liste des dépôts
+// touchés par la session ; la relance de fin de tour les couvre tous en UN bloc (dépôt non relié :
+// Claude le relie sans déranger l'utilisateur, règle 1 de la consigne du serveur). Aucun réseau.
 // Le moteur ne suit `$` que dans CE fichier : tout ce qui touche git, store, réglages ou UI est
 // ici ; hooks/todos.ts et hooks/shared.ts ne contiennent que des fonctions pures.
 // Règle absolue : une erreur ne bloque JAMAIS Claude (chaque hook retombe sur next(e)).
@@ -93,6 +98,20 @@ import {
   projectWriteToast,
   titleFromResult,
 } from './project'
+import {
+  LINK_FILE,
+  type RepoNudge,
+  TOUCHED_KEY,
+  addTouched,
+  commitDirs,
+  linkFileContent,
+  linkFilePath,
+  multiNudgeText,
+  optoutKey,
+  parseLinkFile,
+  resolveDir,
+  touchedRoots,
+} from './repos'
 
 /** Nom de l'outil d'écriture tel que Claude le voit : mcp__plugin_<plugin>_<serveur>__<outil>. */
 const ADD_ENTRY_TOOL = `${MCP_PREFIX}journal_add_entry`
@@ -135,10 +154,14 @@ type Pending = Repo & {
 
 type GitRun = { exitCode: number; stdout: string; stderr: string }
 
-/** Lance git sans shell ; null si git n'a pas pu se lancer ou a dépassé le délai. */
-async function runGit($: EngineInterface, args: readonly string[]): Promise<GitRun | null> {
+/**
+ * Lance git sans shell ; null si git n'a pas pu se lancer ou a dépassé le délai. `dir` : dépôt
+ * visé (`git -C <dir>`), sinon le dossier courant de la session.
+ */
+async function runGit($: EngineInterface, args: readonly string[], dir?: string): Promise<GitRun | null> {
   try {
-    const run = await $.process.run(['git', ...args], { timeoutMs: GIT_TIMEOUT_MS })
+    const argv = dir ? ['git', '-C', dir, ...args] : ['git', ...args]
+    const run = await $.process.run(argv, { timeoutMs: GIT_TIMEOUT_MS })
     return { exitCode: run.exitCode, stdout: run.stdout, stderr: run.stderr }
   } catch {
     return null
@@ -146,18 +169,18 @@ async function runGit($: EngineInterface, args: readonly string[]): Promise<GitR
 }
 
 /** Sortie de git si code 0 ; null si git est absent, échoue ou dépasse le délai. */
-async function git($: EngineInterface, args: readonly string[]): Promise<string | null> {
-  const run = await runGit($, args)
+async function git($: EngineInterface, args: readonly string[], dir?: string): Promise<string | null> {
+  const run = await runGit($, args, dir)
   return run?.exitCode === 0 ? run.stdout.trim() : null
 }
 
-/** Dépôt git de la session ; null hors dépôt (ou git indisponible). */
-async function readRepo($: EngineInterface): Promise<Repo | null> {
-  const paths = await git($, ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'])
+/** Dépôt git de la session (ou du dossier `dir`) ; null hors dépôt (ou git indisponible). */
+async function readRepo($: EngineInterface, dir?: string): Promise<Repo | null> {
+  const paths = await git($, ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'], dir)
   // git < 2.31 ne connaît pas --path-format : la racine sert alors d'identité.
-  const [root, common] = paths ? paths.split('\n').map(p => p.trim()) : [await git($, ['rev-parse', '--show-toplevel'])]
+  const [root, common] = paths ? paths.split('\n').map(p => p.trim()) : [await git($, ['rev-parse', '--show-toplevel'], dir)]
   if (!root) return null
-  const head = await git($, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'])
+  const head = await git($, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], root)
   return { root, id: common || root, head: head && FULL_SHA.test(head) ? head : null }
 }
 
@@ -178,13 +201,36 @@ async function enabledByProject($: EngineInterface): Promise<boolean> {
   return false
 }
 
-/** Projet Idéation retenu pour ce dépôt ; null s'il n'y en a pas (ou store illisible). */
+/** Projet écrit dans `.ideation.json` à la racine du dépôt ; null si absent ou invalide. */
+async function readFileLink($: EngineInterface, repo: Repo): Promise<ProjectLink | null> {
+  try {
+    return parseLinkFile(await $.fs.read(linkFilePath(repo.root)))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Projet Idéation de ce dépôt : `.ideation.json` (prime), sinon le store (liens d'avant 1.6.0,
+ * toujours valables) ; null s'il n'y en a pas.
+ */
 async function readProjectLink($: EngineInterface, repo: Repo | null): Promise<ProjectLink | null> {
   if (repo === null) return null
+  const fromFile = await readFileLink($, repo)
+  if (fromFile) return fromFile
   try {
     return parseProjectLink(await $.store.get(projectKey(repo.id)))
   } catch {
     return null
+  }
+}
+
+/** L'utilisateur a délié ce dépôt (`/journal --delier`) : plus aucun automatisme ici, fichier compris. */
+async function optedOut($: EngineInterface, repo: Repo): Promise<boolean> {
+  try {
+    return (await $.store.get(optoutKey(repo.id))) === true
+  } catch {
+    return false
   }
 }
 
@@ -202,14 +248,71 @@ async function rememberProject($: EngineInterface, repo: Repo | null, input: Rec
   }
 }
 
-/** Le dépôt est-il relié à Idéation (liaison, projet retenu, ou plugin activé pour ce dépôt) ? */
-async function isLinked($: EngineInterface, repo: Repo | null): Promise<boolean> {
+/**
+ * Le dépôt est-il relié à Idéation (`.ideation.json`, liaison, projet retenu, ou plugin activé
+ * pour ce dépôt) ? `here` : dépôt du dossier courant, le seul dont les réglages de projet
+ * (`enabledPlugins`) comptent. Un dépôt délié par l'utilisateur ne l'est jamais.
+ */
+async function isLinked($: EngineInterface, repo: Repo | null, here = true): Promise<boolean> {
   if (repo === null) return false
+  if (await optedOut($, repo)) return false
   return (
     (await $.store.get(linkedKey(repo.id))) === true ||
     (await readProjectLink($, repo)) !== null ||
-    (await enabledByProject($))
+    (here && (await enabledByProject($)))
   )
+}
+
+/** Id de la session (clé de la liste des dépôts touchés) ; 'session' si l'hôte ne le donne pas. */
+async function sessionId($: EngineInterface): Promise<string> {
+  try {
+    const id = await $.session.id()
+    return typeof id === 'string' && id ? id : 'session'
+  } catch {
+    return 'session'
+  }
+}
+
+/** Dépôts (racines) où cette session a commité, dans l'ordre ; vide si le store est illisible. */
+async function readTouched($: EngineInterface): Promise<string[]> {
+  try {
+    return touchedRoots(await $.store.get(TOUCHED_KEY), await sessionId($))
+  } catch {
+    return []
+  }
+}
+
+/** Ajoute des dépôts à la liste de la session (échec du store avalé). */
+async function rememberTouched($: EngineInterface, roots: readonly string[]): Promise<void> {
+  if (roots.length === 0) return
+  try {
+    const id = await sessionId($)
+    await $.store.set(TOUCHED_KEY, addTouched(await $.store.get(TOUCHED_KEY), id, roots, Date.now()))
+  } catch {
+    // Store en panne : ce dépôt ne sera pas relancé, rien de plus.
+  }
+}
+
+/**
+ * Dossier absolu écrit par Claude (commande Bash, `repo_path`) : relatif au dossier courant de
+ * la session, `~` au dossier personnel. null si on ne peut pas le résoudre.
+ */
+async function absoluteDir($: EngineInterface, dir: string): Promise<string | null> {
+  const cwd = await $.session.cwd().catch(() => '')
+  const home = dir === '~' || dir.startsWith('~/') ? await $.env.get('HOME').catch(() => undefined) : undefined
+  return resolveDir(cwd, home, dir)
+}
+
+/** Dépôts visés par les `git commit` d'une commande Bash (dédoublonnés, dossier courant compris). */
+async function commitRepos($: EngineInterface, command: string): Promise<Repo[]> {
+  const repos: Repo[] = []
+  for (const dir of commitDirs(command)) {
+    const path = dir === '' ? undefined : await absoluteDir($, dir)
+    if (path === null) continue
+    const repo = await readRepo($, path)
+    if (repo && !repos.some(r => r.root === repo.root)) repos.push(repo)
+  }
+  return repos
 }
 
 /** Les UI ($.ui.*) sont décoratives : leur échec ne doit rien casser. */
@@ -303,8 +406,9 @@ async function isAncestor(
   $: EngineInterface,
   ancestor: string,
   of: string,
+  dir?: string,
 ): Promise<'oui' | 'non' | 'inconnu'> {
-  const run = await runGit($, ['merge-base', '--is-ancestor', ancestor, of])
+  const run = await runGit($, ['merge-base', '--is-ancestor', ancestor, of], dir)
   if (run === null) return 'inconnu'
   if (run.exitCode === 0) return 'oui'
   if (run.exitCode === 1) return 'non'
@@ -313,8 +417,8 @@ async function isAncestor(
 }
 
 /** Filtre git « commits dont je suis le committer » ; vide (= tout compter) sans user.email. */
-async function mineFilter($: EngineInterface): Promise<string[]> {
-  const email = await git($, ['config', '--get', 'user.email'])
+async function mineFilter($: EngineInterface, dir?: string): Promise<string[]> {
+  const email = await git($, ['config', '--get', 'user.email'], dir)
   return email && !/[\s<>]/.test(email) ? ['--fixed-strings', `--committer=<${email}>`] : []
 }
 
@@ -340,19 +444,16 @@ async function readPending($: EngineInterface, known?: Repo | null): Promise<Pen
   if (typeof stored !== 'string' || !FULL_SHA.test(stored)) return reset()
   if (stored === repo.head) return { ...repo, base: stored, count: 0, mine: [] }
 
-  const ancestry = await isAncestor($, stored, repo.head)
+  const ancestry = await isAncestor($, stored, repo.head, repo.root)
   if (ancestry === 'inconnu') return undefined
   if (ancestry === 'non') return reset()
 
-  const mine = await mineFilter($)
-  const counted = await git($, [
-    'rev-list',
-    '--count',
-    '--first-parent',
-    '--no-merges',
-    ...mine,
-    `${stored}..${repo.head}`,
-  ])
+  const mine = await mineFilter($, repo.root)
+  const counted = await git(
+    $,
+    ['rev-list', '--count', '--first-parent', '--no-merges', ...mine, `${stored}..${repo.head}`],
+    repo.root,
+  )
   if (counted === null) return undefined
   const count = Number.parseInt(counted, 10)
   return { ...repo, base: stored, count: Number.isFinite(count) && count > 0 ? count : 0, mine }
@@ -385,18 +486,18 @@ async function baseAfterEntry(
     newest = repo.head
   } else {
     for (const sha of shas) {
-      if ((await isAncestor($, sha, repo.head)) !== 'oui') continue
-      if (newest === null || (await isAncestor($, newest, sha)) === 'oui') newest = sha
+      if ((await isAncestor($, sha, repo.head, repo.root)) !== 'oui') continue
+      if (newest === null || (await isAncestor($, newest, sha, repo.root)) === 'oui') newest = sha
     }
   }
   if (newest === null || newest === stored) return null
   if (typeof stored !== 'string' || !FULL_SHA.test(stored)) return newest
-  const forward = await isAncestor($, stored, newest)
+  const forward = await isAncestor($, stored, newest, repo.root)
   if (forward === 'oui') return newest
   if (forward === 'inconnu') return null
   // Ligne de base actuelle plus récente que le commit cité : on ne recule pas. Plus du tout
   // ancêtre de HEAD (rebase…) : elle est périmée, le commit cité la remplace.
-  return (await isAncestor($, stored, repo.head)) === 'non' ? newest : null
+  return (await isAncestor($, stored, repo.head, repo.root)) === 'non' ? newest : null
 }
 
 /** Rappel ajouté au résultat quand la clé était déjà prise (`created:false`). */
@@ -410,9 +511,32 @@ async function readLinkedPending($: EngineInterface): Promise<Pending | null | u
   return readPending($, repo)
 }
 
-function statusText(pending: Pending | null): string | undefined {
-  if (!pending || pending.count === 0) return undefined
-  return `📓 ${pending.count} commit${pending.count > 1 ? 's' : ''} à journaliser`
+function statusText(pending: Pending | null, others: readonly number[] = []): string | undefined {
+  const counts = [pending?.count ?? 0, ...others].filter(n => n > 0)
+  const total = counts.reduce((a, b) => a + b, 0)
+  if (total === 0) return undefined
+  const where = counts.length > 1 ? ` (${counts.length} dépôts)` : ''
+  return `📓 ${total} commit${total > 1 ? 's' : ''} à journaliser${where}`
+}
+
+/**
+ * Commits en attente des AUTRES dépôts reliés où cette session a commité (hors `except`, le
+ * dépôt courant) : la ligne d'état les additionne. Vide si aucun ; jamais d'erreur.
+ */
+async function otherCounts($: EngineInterface, except: string | undefined): Promise<number[]> {
+  const counts: number[] = []
+  try {
+    for (const root of await readTouched($)) {
+      if (root === except) continue
+      const repo = await readRepo($, root)
+      if (!repo || repo.root === except || !(await isLinked($, repo, false))) continue
+      const pending = await readPending($, repo)
+      if (pending && pending.count > 0) counts.push(pending.count)
+    }
+  } catch {
+    // Décoratif : un dépôt illisible ne compte pas.
+  }
+  return counts
 }
 
 /**
@@ -421,7 +545,7 @@ function statusText(pending: Pending | null): string | undefined {
  */
 async function showStatus($: EngineInterface, pending: Pending | null | undefined, todoMode: Mode = 'off'): Promise<void> {
   if (pending === undefined) return
-  let text = statusText(pending)
+  let text = statusText(pending, await otherCounts($, pending?.root))
   if (todoMode === 'rappel' && pending) {
     const part = todoStatusPart(await readMarkers($, pending.root))
     if (part) text = text ? `${text} · ${part}` : part
@@ -473,15 +597,19 @@ async function todoOnlyNudge(
 /** Derniers commits non journalisés, « <sha court> <sujet> », pour la relance. */
 async function listCommits($: EngineInterface, pending: Pending): Promise<string[]> {
   if (!pending.base || !pending.head) return []
-  const log = await git($, [
-    'log',
-    '--first-parent',
-    '--no-merges',
-    `--max-count=${LISTED_COMMITS}`,
-    ...pending.mine,
-    '--format=%h %s',
-    `${pending.base}..${pending.head}`,
-  ])
+  const log = await git(
+    $,
+    [
+      'log',
+      '--first-parent',
+      '--no-merges',
+      `--max-count=${LISTED_COMMITS}`,
+      ...pending.mine,
+      '--format=%h %s',
+      `${pending.base}..${pending.head}`,
+    ],
+    pending.root,
+  )
   if (!log) return []
   return log
     .split('\n')
@@ -584,12 +712,26 @@ export const register: Register = (on, options) => {
     return { sections: [...composed.sections, ...added] }
   }).catch(($, e, next) => next(e))
 
-  // Après une commande git qui déplace HEAD : statut à jour.
+  // `git commit` : AVANT la commande, la ligne de base de chaque dépôt visé est fixée (un dépôt vu
+  // pour la première fois part de son HEAD d'avant le commit) ; APRÈS, ces dépôts rejoignent la
+  // liste des dépôts touchés par la session. Toute commande git qui déplace HEAD : statut à jour.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const command = String(e.command)
+    let targets: Repo[] = []
+    if (mode !== 'off' && /\bcommit\b/.test(command)) {
+      try {
+        targets = await commitRepos($, command)
+        for (const repo of targets) await readPending($, repo)
+      } catch {
+        targets = []
+      }
+    }
     const ran = await next(e)
-    if (mode !== 'off' && ran.deny === undefined && GIT_MOVES_HEAD.test(String(e.command))) {
-      // Hors dépôt relié : statut vidé (cas d'un `cd` vers un autre dépôt).
-      await showStatus($, await readLinkedPending($), todoMode)
+    if (mode !== 'off' && ran.deny === undefined) {
+      await rememberTouched($, targets.map(r => r.root))
+      // Hors dépôt relié : statut vidé (cas d'un `cd` vers un autre dépôt), sauf les autres
+      // dépôts reliés touchés par la session, qui restent comptés.
+      if (GIT_MOVES_HEAD.test(command)) await showStatus($, await readLinkedPending($), todoMode)
     }
     return ran
   }).catch(($, e, next) => next(e))
@@ -605,17 +747,35 @@ export const register: Register = (on, options) => {
       if (mode !== 'off') await quietly(() => $.ui.toast('📓 Clé déjà prise : entrée non ajoutée (rejeu ?)'))
       return { ...ran, context: [...(ran.context ?? []), NOT_CREATED_CONTEXT] }
     }
+    const input = e as unknown as Record<string, unknown>
     const repo = await readRepo($)
-    if (repo) {
-      // Une entrée écrite depuis ce dépôt le relie au projet du jeton.
-      await $.store.set(linkedKey(repo.id), true)
-      await rememberProject($, repo, e as unknown as Record<string, unknown>, ran)
-      const key = baseKey(repo.root)
-      const base = await baseAfterEntry($, repo, await $.store.get(key), (e as { commits?: unknown }).commits)
+    // Dépôt de l'entrée : celui dont les commits cités sont dans HEAD, ou dont le projet est celui
+    // de l'appel, parmi le dépôt courant et ceux où la session a commité ; à défaut, le courant.
+    const candidates: Repo[] = repo ? [repo] : []
+    for (const root of await readTouched($)) {
+      if (candidates.some(r => r.root === root)) continue
+      const other = await readRepo($, root)
+      if (other && !candidates.some(r => r.root === other.root)) candidates.push(other)
+    }
+    const pid = typeof input.project_id === 'string' ? input.project_id.trim() : ''
+    let matched = false
+    for (const target of candidates) {
+      const key = baseKey(target.root)
+      const base = await baseAfterEntry($, target, await $.store.get(key), (e as { commits?: unknown }).commits)
+      const sameProject = pid !== '' && (await readProjectLink($, target))?.id === pid
+      if (base === null && !sameProject) continue
+      matched = true
+      // Une entrée écrite pour ce dépôt le relie au projet du jeton.
+      await $.store.set(linkedKey(target.id), true)
+      await rememberProject($, target, input, ran)
       if (base !== null) {
         await $.store.set(key, base)
-        await $.store.delete(nudgedKey(repo.root))
+        await $.store.delete(nudgedKey(target.root))
       }
+    }
+    if (!matched && repo) {
+      await $.store.set(linkedKey(repo.id), true)
+      await rememberProject($, repo, input, ran)
     }
     await refreshStatus($, repo, mode, todoMode)
     if (mode !== 'off') {
@@ -639,30 +799,63 @@ export const register: Register = (on, options) => {
     // Un autre hook bloque déjà ou arrête la session : on ne s'en mêle pas.
     if (stopped.block !== undefined || stopped.preventContinuation) return stopped
 
-    // Dépôt non relié : jamais de relance (sinon le travail d'un autre dépôt fuirait
-    // dans le journal ou les to-dos du projet du jeton).
+    // Dépôts couverts : le courant s'il est relié, puis chaque dépôt où la session a commité.
+    // Un dépôt non relié n'est relancé QUE si la session y a commité (règle 1 : Claude le relie
+    // au bon projet), jamais s'il a été délié ; le travail d'un dépôt ne va qu'au projet de ce dépôt.
     const repo = await readRepo($)
-    if (!repo || !(await isLinked($, repo))) return stopped
+    const linkedHere = repo !== null && (await isLinked($, repo))
+    const touched = mode !== 'off' ? await readTouched($) : []
+    if (!linkedHere && touched.length === 0) return stopped
 
     let block: string | undefined
     if (mode !== 'off') {
-      const pending = await readPending($, repo)
-      const key = nudgedKey(repo.root)
-      if (pending?.head && pending.count > 0 && (await $.store.get(key)) !== pending.head) {
+      const due: { repo: Repo; pending: Pending; linked: boolean; here: boolean }[] = []
+      const seen = new Set<string>()
+      const consider = async (target: Repo, here: boolean, linked: boolean) => {
+        if (seen.has(target.root)) return
+        seen.add(target.root)
+        // Non relié : seulement en `auto` (relier sans déranger), jamais s'il a été délié.
+        if (!linked && (mode !== 'auto' || (await optedOut($, target)))) return
+        const pending = await readPending($, target)
+        const key = nudgedKey(target.root)
+        if (!pending?.head || pending.count === 0 || (await $.store.get(key)) === pending.head) return
         await $.store.set(key, pending.head)
-        if (mode === 'rappel') {
-          await showStatus($, pending, todoMode)
-          await quietly(() =>
-            $.ui.toast(
-              `📓 ${plural(pending.count, 'commit')} pas encore dans le Journal de bord — tape /journal pour l'écrire.`,
-            ),
-          )
-        } else {
-          block = nudgeText(pending, await listCommits($, pending))
+        due.push({ repo: target, pending, linked, here })
+      }
+      if (repo && linkedHere) await consider(repo, true, true)
+      for (const root of touched) {
+        const target = repo && root === repo.root ? repo : await readRepo($, root)
+        if (!target) continue
+        const here = repo !== null && target.root === repo.root
+        await consider(target, here, here ? linkedHere : await isLinked($, target, false))
+      }
+      if (due.length > 0 && mode === 'rappel') {
+        const total = due.reduce((n, d) => n + d.pending.count, 0)
+        await showStatus($, due.find(d => d.here)?.pending ?? null, todoMode)
+        await quietly(() =>
+          $.ui.toast(`📓 ${plural(total, 'commit')} pas encore dans le Journal de bord : tape /journal pour l'écrire.`),
+        )
+      } else if (due.length === 1 && due[0]?.here && due[0].linked) {
+        // Cas d'avant 1.6.0 (un seul dépôt, le courant, relié) : même relance.
+        block = nudgeText(due[0].pending, await listCommits($, due[0].pending))
+      } else if (due.length > 0) {
+        const parts: RepoNudge[] = []
+        for (const d of due) {
+          parts.push({
+            root: d.repo.root,
+            link: d.linked ? await readProjectLink($, d.repo) : null,
+            linked: d.linked,
+            base: d.pending.base,
+            count: d.pending.count,
+            mine: d.pending.mine.length > 0,
+            commits: await listCommits($, d.pending),
+          })
         }
+        block = multiNudgeText(parts)
       }
     }
-    if (todoMode === 'off') return block === undefined ? stopped : { ...stopped, block }
+    // To-dos : marqueurs du dépôt courant, seulement s'il est relié.
+    if (todoMode === 'off' || !repo || !linkedHere) return block === undefined ? stopped : { ...stopped, block }
 
     // Partie to-dos : une panne (store…) ne doit jamais faire perdre la relance du journal.
     try {
@@ -687,10 +880,12 @@ export const register: Register = (on, options) => {
     const note = e.args.trim().replace(/\s+/g, ' ').slice(0, 300)
     const repo = await readRepo($)
     if (note === UNLINK_ARG) {
-      // Délier oublie aussi le projet retenu (sinon il vaudrait encore liaison).
+      // Délier oublie aussi le projet retenu (sinon il vaudrait encore liaison) et coupe tout
+      // automatisme ici, `.ideation.json` compris (choix local : le fichier n'est pas touché).
       if (repo) {
         await $.store.delete(linkedKey(repo.id))
         await $.store.delete(projectKey(repo.id))
+        await $.store.set(optoutKey(repo.id), true)
       }
       await quietly(() => $.ui.status(undefined))
       return {
@@ -714,7 +909,10 @@ export const register: Register = (on, options) => {
       }
     }
     // /journal est un geste explicite : il relie ce dépôt au projet du jeton.
-    if (repo) await $.store.set(linkedKey(repo.id), true)
+    if (repo) {
+      await $.store.delete(optoutKey(repo.id))
+      await $.store.set(linkedKey(repo.id), true)
+    }
     const pending = await readPending($, repo)
     const text = journalPrompt(pending, note)
     // prompt.submit attendrait le tour que ce hook tient : on le lance juste après,
@@ -856,22 +1054,39 @@ export const register: Register = (on, options) => {
   // le dépôt. Aucun appel réseau : l'appartenance au projet est vérifiée par le serveur à chaque
   // appel d'outil ideation.
   on('tool.call', { tool: LINK_TOOL }, async ($, e) => {
-    const link = linkFromInput(e as unknown as Record<string, unknown>)
+    const input = e as unknown as Record<string, unknown>
+    const link = linkFromInput(input)
     if (!link) {
       return { result: 'project_id invalide : reprends l’id exact renvoyé par projects_list.', isError: true as const }
     }
-    const repo = await readRepo($)
+    const wanted = typeof input.repo_path === 'string' ? input.repo_path.trim() : ''
+    const dir = wanted ? await absoluteDir($, wanted) : undefined
+    const repo = dir === null ? null : await readRepo($, dir)
     if (!repo) {
       return {
-        result: `Pas de dépôt git ici : rien à relier. Passe simplement project_id: '${link.id}' à chaque outil ideation.`,
+        result: `Pas de dépôt git ${wanted ? `à « ${wanted.slice(0, 200)} »` : 'ici'} : rien à relier. Passe simplement project_id: '${link.id}' à chaque outil ideation.`,
         isError: true as const,
       }
     }
+    // Le fichier fait foi pour toute session, toute machine, tout coéquipier ; le store reste le
+    // filet si l'écriture échoue (dossier en lecture seule…).
+    const path = linkFilePath(repo.root)
+    const content = linkFileContent(link)
+    let wrote = true
+    try {
+      await $.fs.write(path, content)
+    } catch {
+      wrote = false
+    }
     await $.store.set(projectKey(repo.id), link)
     await $.store.set(linkedKey(repo.id), true)
+    await $.store.delete(optoutKey(repo.id))
     await quietly(() => $.ui.toast(`🔗 Dépôt relié au projet Idéation${link.title ? ` : ${link.title}` : ''}`))
+    const file = wrote
+      ? ` Fichier ${path} écrit : laisse-le dans le dépôt, il part avec le prochain commit (aucun secret).`
+      : ` Fichier ${path} NON écrit : crée-le avec ce contenu exact : ${content.trim()}`
     return {
-      result: `Dépôt relié au projet Idéation ${link.title ? `« ${link.title} » ` : ''}(${link.id}). Passe project_id: '${link.id}' à CHAQUE outil ideation.`,
+      result: `Dépôt ${repo.root} relié au projet Idéation ${link.title ? `« ${link.title} » ` : ''}(${link.id}). Passe project_id: '${link.id}' à CHAQUE outil ideation pour ce dépôt.${file}`,
     }
   }).catch(() => ({
     result: "Impossible d'enregistrer le lien (store indisponible). Passe quand même project_id à chaque outil ideation.",
@@ -884,10 +1099,13 @@ export const register: Register = (on, options) => {
     const repo = await readRepo($)
     if (note === FORGET_ARG) {
       if (repo) await $.store.delete(projectKey(repo.id))
+      const fromFile = repo ? await readFileLink($, repo) : null
       return {
-        text: repo
-          ? "🔗 Projet oublié pour ce dépôt : Claude te redemandera lequel utiliser avant d'écrire."
-          : '🔗 Pas de dépôt git ici : rien à oublier.',
+        text: !repo
+          ? '🔗 Pas de dépôt git ici : rien à oublier.'
+          : fromFile
+            ? `🔗 Le fichier ${LINK_FILE} du dépôt relie encore ce dépôt au projet ${fromFile.id} : supprime-le (et commite) pour le délier pour tout le monde, ou tape /journal --delier pour couper l'automatisme sur ce poste seulement.`
+            : "🔗 Projet oublié pour ce dépôt : Claude te redemandera lequel utiliser avant d'écrire.",
       }
     }
     if (!note || !repo) return { text: projectStatusText(await readProjectLink($, repo), repo !== null) }

@@ -257,7 +257,7 @@ describe('auto_journal', () => {
   test('rappel : notification + statut une fois par HEAD, jamais de relance', RAPPEL, async ($, on) => {
     const w = world(on, { git: PENDING, store: BASE_A })
     expect(await $.classic.Stop(stop())).toEqual({})
-    expect(w.toasts).toEqual(["📓 2 commits pas encore dans le Journal de bord — tape /journal pour l'écrire."])
+    expect(w.toasts).toEqual(["📓 2 commits pas encore dans le Journal de bord : tape /journal pour l'écrire."])
     expect(w.statuses).toEqual(['📓 2 commits à journaliser'])
     expect(await $.classic.Stop(stop())).toEqual({})
     expect(w.toasts.length).toBe(1)
